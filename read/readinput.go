@@ -81,16 +81,16 @@ func IsExcludedCharacter(allExcludedChars []byte) func(r rune) bool {
 	}
 }
 
-func FindLinesContainingByteSequences(file *os.File, searchFor ...BSeq) *SearchResultPool {
-	search := newSearch(searchFor...)
+func FindLinesContainingByteSequences(file *os.File, seqs ...BSeq) *SearchResultPool {
+	searchFor := newSearch(seqs...)
 	fanIn := make(chan *SearchResult)
 	searchResults := make([]*SearchResult, 0)
-	resultChannels := fanOutFinders(file, search)
+	resultChannels := fanOutFinders(file, searchFor)
 	go fanInResults(resultChannels, fanIn)
 	for result := range fanIn {
 		searchResults = append(searchResults, result)
 	}
-	return &SearchResultPool{searchResults, search}
+	return &SearchResultPool{searchResults, searchFor}
 }
 
 type SearchResultPool struct {
@@ -110,10 +110,26 @@ func (search *Search) Index(target BSeq) (int, bool) {
 	return slices.BinarySearchFunc(*search, target, cmp)
 }
 
+type data interface {
+	int | string | byte | float64
+}
+
 type Extractor func(*SearchResultPool)
 
 func (extract *Extractor) From(pool *SearchResultPool) {
 	(*extract)(pool)
+}
+
+func newExtractor[T data](identifier BSeq, valueGetter func(inLineIndices []int, line []byte, identifier BSeq) []T) (*[]T, Extractor) {
+	values := make([]T, 0)
+	return &values, func(pool *SearchResultPool) {
+		index, _ := pool.SearchFor.Index(identifier)
+		for _, sr := range pool.Results {
+			if indices, ok := sr.Result[index]; ok {
+				values = append(values, valueGetter(indices, sr.B, identifier)...)
+			}
+		}
+	}
 }
 
 func fanOutFinders(file *os.File, bs *Search) []chan *SearchResult {
@@ -189,13 +205,13 @@ func (s *BSeq) equals(o BSeq) bool {
 }
 
 func findFirstInstances(input []byte, byteSequences *Search, result chan<- *SearchResult) {
-	if res, ok := IndicesOfFirstInstances(input, byteSequences); ok {
+	if res, ok := IndexFirstInstance(input, byteSequences); ok {
 		result <- res
 	}
 	close(result)
 }
 
-func IndicesOfFirstInstances(input []byte, searchFor *Search) (*SearchResult, bool) {
+func IndexFirstInstance(input []byte, searchFor *Search) (*SearchResult, bool) {
 	mp, ok := Find(input).FirstInstances(searchFor)
 	return newSearchResult(input, mp), ok
 }
@@ -210,28 +226,78 @@ func (f Find) FirstInstances(searchSequences *Search) (map[int][]int, bool) {
 	return IndexOfFirstInstance(f, searchSequences)
 }
 
-func IndexOfFirstInstance(b []byte, searchFor *Search) (map[int][]int, bool) {
-	const nothingFound = false
-	const found = true
-	presentIdentifiers := make(map[int][]int)
-	for k, sep := range *searchFor {
-		index := bytes.Index(b, sep)
-		if index != -1 {
-			appendElementToKListOfMap(presentIdentifiers, k, index)
-		}
-	}
-	if len(presentIdentifiers) == 0 {
-		return nil, nothingFound
-	}
-	return presentIdentifiers, found
+func (f Find) AllInstances(searchSequences *Search) (map[int][]int, bool) {
+	return IndexOfAllInstances(f, searchSequences)
 }
 
-func appendElementToKListOfMap(m map[int][]int, k, element int) {
+type Indexer func([]byte, []byte) []int
+
+func (f *Indexer) Apply(bs, sep []byte) []int {
+	return (*f)(bs, sep)
+}
+
+func IndexOfAllInstances(b []byte, searchFor *Search) (map[int][]int, bool) {
+	return SequenceIndexerFunc(b, searchFor, IndexAllInstances)
+}
+
+func IndexOfFirstInstance(b []byte, searchFor *Search) (map[int][]int, bool) {
+	return SequenceIndexerFunc(b, searchFor, ListWithJustFirstInstanceIndex)
+}
+
+func SequenceIndexerFunc(b []byte, searchFor *Search, indexer func(b []byte, sep []byte) []int) (map[int][]int, bool) {
+	successfulSequences := LocateSequencesIndexerFunc(b, searchFor, indexer)
+	return successfulSequences, len(successfulSequences) > 0
+}
+
+func LocateSequencesIndexerFunc(b []byte, searchFor *Search, indexer Indexer) map[int][]int {
+	presentIdentifiers := make(map[int][]int)
+	chanList := make([]chan []int, 0)
+	for _, sep := range *searchFor {
+		c := make(chan []int)
+		chanList = append(chanList, c)
+		go func(b, sep []byte, indexer Indexer, c chan []int) {
+			indices := indexer.Apply(b, sep)
+			if indices != nil && len(indices) > 0 {
+				c <- indices
+			}
+			close(c)
+		}(b, sep, indexer, c)
+	}
+	fanIn := make(chan struct {
+		i int
+		v []int
+	})
+	go func(cl []chan []int) {
+		for k, ch := range cl {
+			for res := range ch {
+				fanIn <- struct {
+					i int
+					v []int
+				}{k, res}
+			}
+		}
+		close(fanIn)
+	}(chanList)
+	for fc := range fanIn {
+		appendElementsToKListOfMap(presentIdentifiers, fc.i, fc.v...)
+	}
+	return presentIdentifiers
+}
+
+func ListWithJustFirstInstanceIndex(b, sep []byte) []int {
+	index := bytes.Index(b, sep)
+	if index == -1 {
+		return nil
+	}
+	return []int{index}
+}
+
+func appendElementsToKListOfMap(m map[int][]int, k int, elements ...int) {
 	list := m[k]
 	if list == nil {
 		list = make([]int, 0)
 	}
-	list = append(list, element)
+	list = append(list, elements...)
 	m[k] = list
 }
 
@@ -240,9 +306,15 @@ func IndexAllInstances(b, sep []byte) []int {
 	offset := 0
 	for len(b) > len(sep) {
 		index := bytes.Index(b, sep)
+		if index == -1 {
+			break
+		}
 		indices = append(indices, index+offset)
 		b = b[index+len(sep):]
 		offset += index + len(sep)
+	}
+	if len(indices) == 0 {
+		return nil
 	}
 	return indices
 }
